@@ -1,12 +1,8 @@
 /*
  * SAM3 Video Prompt Editor
  *
- * - Overlay above Comfy canvas (Ctrl/RMB работают, zoom следует за графом).
- * - Insets: границы и уголок LiteGraph свободны для resize.
- * - 4 независимых счётчика индексов бейджей:
- *      +points, -points, +boxes, -boxes (каждый нумеруется 0,1,2… внутри своего типа).
- * - Негативные боксы поддерживаются (оранжевые, чуть затенены).
- * - Внутренние подсказки удалены — справка идёт через Python DESCRIPTION.
+ * Modified version: Shift/Ctrl modifiers used to draw points and boxes.
+ * Dropdown prompt_mode is hidden to simplify the UI.
  */
 
 import { app } from "../../scripts/app.js";
@@ -68,7 +64,7 @@ function findUpstreamInitNode(node) {
     return null;
 }
 
-function findUpstreamVideoFilename(node, seen = new Set()) {
+function findImageProducer(node, seen = new Set()) {
     if (!node || seen.has(node.id)) return null;
     seen.add(node.id);
     if (node.widgets) {
@@ -85,9 +81,27 @@ function findUpstreamVideoFilename(node, seen = new Set()) {
         const link = node.graph.links[inp.link];
         if (!link) continue;
         const up = node.graph.getNodeById(link.origin_id);
-        const res = findUpstreamVideoFilename(up, seen);
+        const res = findImageProducer(up, seen);
         if (res) return res;
     }
+    return null;
+}
+
+function findUpstreamVideoFilename(node) {
+    if (node && node.inputs) {
+        for (const inp of node.inputs) {
+            if (inp.name === "image" && inp.link != null) {
+                const link = node.graph.links[inp.link];
+                if (link) {
+                    const up = node.graph.getNodeById(link.origin_id);
+                    const fn = findImageProducer(up);
+                    if (fn) return fn;
+                }
+            }
+        }
+    }
+    const init = findUpstreamInitNode(node);
+    if (init) return findImageProducer(init);
     return null;
 }
 
@@ -180,6 +194,7 @@ app.registerExtension({
             hideWidget(wPoints);
             hideWidget(wBoxes);
             hideWidget(wCache);
+            hideWidget(wMode); // Скрываем выпадающий список за ненадобностью
 
             if (!node.size || node.size[0] < MIN_NODE_W) {
                 node.size = [DEFAULT_W, DEFAULT_H];
@@ -255,10 +270,8 @@ app.registerExtension({
             };
             node._sam3 = state;
 
-            function mode() { return wMode ? wMode.value : "points"; }
             function maxFrame() { return Math.max(0, (state.numFrames || 1) - 1); }
 
-            /** Index of element within its own type array (4 independent counters). */
             function indexInType(kind, idx) {
                 if (kind === "pos_pt" || kind === "neg_pt") {
                     const want = kind === "pos_pt" ? 1 : 0;
@@ -321,8 +334,7 @@ app.registerExtension({
                 overlay.style.height = `${h}px`;
                 overlay.style.transform = "none";
 
-                const sizeChanged =
-                    Math.abs(w - state.ow) > 0.5 || Math.abs(h - state.oh) > 0.5;
+                const sizeChanged = Math.abs(w - state.ow) > 0.5 || Math.abs(h - state.oh) > 0.5;
                 state.ow = w;
                 state.oh = h;
                 state.visible = true;
@@ -427,18 +439,16 @@ app.registerExtension({
                             ? `Loading ${state.loadingIdx}...`
                             : (state.sid || state.previewKey
                                 ? "Waiting for frame..."
-                                : "Connect Init Session → Load Video"),
+                                : "Connect Init Session or Image input"),
                         w * 0.5, state.viewH * 0.5
                     );
                 }
 
-                const m = mode();
-                if (m === "boxes") {
-                    for (let i = 0; i < state.boxes.length; i++) drawBox(state.boxes[i], i);
-                    if (state.drawingBox) drawBox(state.drawingBox, -1, true);
-                } else {
-                    for (let i = 0; i < state.points.length; i++) drawPoint(state.points[i], i);
-                }
+                for (let i = 0; i < state.boxes.length; i++) drawBox(state.boxes[i], i);
+                if (state.drawingBox) drawBox(state.drawingBox, -1, true);
+                
+                for (let i = 0; i < state.points.length; i++) drawPoint(state.points[i], i);
+                
                 ctx.restore();
 
                 const sy = h - SLIDER_H;
@@ -523,14 +533,10 @@ app.registerExtension({
 
                 ctx.beginPath();
                 ctx.arc(vx, vy, rad + (hot ? 3 : 0), 0, Math.PI * 2);
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 2.5;
-                ctx.stroke();
+                ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
 
-                ctx.beginPath();
-                ctx.arc(vx, vy, 2, 0, Math.PI * 2);
-                ctx.fillStyle = "#ff5050";
-                ctx.fill();
+                ctx.beginPath(); ctx.arc(vx, vy, 2, 0, Math.PI * 2);
+                ctx.fillStyle = "#ff5050"; ctx.fill();
 
                 drawIndexBadge(vx, vy, rad, color, typeIdx, hot);
             }
@@ -590,32 +596,29 @@ app.registerExtension({
             }
 
             function hitTest(ix, iy) {
-                const m = mode();
                 const sc = Math.max(1e-6, state.scale);
                 const hitImg = HIT_PAD / sc;
-                if (m === "points") {
-                    for (let i = state.points.length - 1; i >= 0; i--) {
-                        const p = state.points[i];
-                        const dx = p.x - ix, dy = p.y - iy;
-                        const rad = hitImg + POINT_RADIUS / sc;
-                        if (dx * dx + dy * dy <= rad * rad) return { type: "point", idx: i };
+                
+                for (let i = state.points.length - 1; i >= 0; i--) {
+                    const p = state.points[i];
+                    const dx = p.x - ix, dy = p.y - iy;
+                    const rad = hitImg + POINT_RADIUS / sc;
+                    if (dx * dx + dy * dy <= rad * rad) return { type: "point", idx: i };
+                }
+                const hR = (HANDLE_SIZE / 2 + HIT_PAD) / sc;
+                for (let i = state.boxes.length - 1; i >= 0; i--) {
+                    const b = state.boxes[i];
+                    for (const h of getBoxHandles(b)) {
+                        if (Math.abs(h.x - ix) <= hR && Math.abs(h.y - iy) <= hR)
+                            return { type: "box", idx: i, handle: h.id };
                     }
-                } else {
-                    const hR = (HANDLE_SIZE / 2 + HIT_PAD) / sc;
-                    for (let i = state.boxes.length - 1; i >= 0; i--) {
-                        const b = state.boxes[i];
-                        for (const h of getBoxHandles(b)) {
-                            if (Math.abs(h.x - ix) <= hR && Math.abs(h.y - iy) <= hR)
-                                return { type: "box", idx: i, handle: h.id };
-                        }
-                    }
-                    for (let i = state.boxes.length - 1; i >= 0; i--) {
-                        const b = state.boxes[i];
-                        const x0 = Math.min(b.x0, b.x1), x1 = Math.max(b.x0, b.x1);
-                        const y0 = Math.min(b.y0, b.y1), y1 = Math.max(b.y0, b.y1);
-                        if (ix >= x0 && ix <= x1 && iy >= y0 && iy <= y1)
-                            return { type: "box", idx: i, handle: "move" };
-                    }
+                }
+                for (let i = state.boxes.length - 1; i >= 0; i--) {
+                    const b = state.boxes[i];
+                    const x0 = Math.min(b.x0, b.x1), x1 = Math.max(b.x0, b.x1);
+                    const y0 = Math.min(b.y0, b.y1), y1 = Math.max(b.y0, b.y1);
+                    if (ix >= x0 && ix <= x1 && iy >= y0 && iy <= y1)
+                        return { type: "box", idx: i, handle: "move" };
                 }
                 return null;
             }
@@ -645,7 +648,7 @@ app.registerExtension({
                 if (state.sid) data = await getSessionFrame(state.sid, idx);
                 else if (state.previewKey) data = await getPreviewFrame(state.previewKey, idx);
                 state.loadingIdx = null;
-                if (!data?.b64) { draw(); return; }
+                if (!data?.b64) { return; }
                 const im = new Image();
                 im.onload = () => {
                     state.frames[idx] = im;
@@ -660,68 +663,58 @@ app.registerExtension({
             }
 
             async function refreshFromUpstream() {
-                const init = findUpstreamInitNode(node);
-                if (!init) {
-                    state.sid = null; state.previewKey = null;
-                    state.numFrames = 0; state.frames = {};
-                    draw(); return;
-                }
-                let sid = init._sam3_last_sid || null;
-                if (!sid) {
-                    const lst = await listSessions();
-                    if (lst?.sessions?.length) sid = lst.sessions[lst.sessions.length - 1].sid;
-                }
-                if (sid) {
-                    const meta = await getSessionMeta(sid);
-                    if (meta) {
-                        if (state.sid !== sid) {
-                            state.sid = sid;
-                            state.previewKey = null;
-                            state.numFrames = meta.n;
-                            state.frames = {};
-                            state.imgW = meta.w; state.imgH = meta.h;
-                            state.fittedOnce = false;
-                            if (state.curIdx >= meta.n) state.curIdx = 0;
-                        }
+                const filename = findUpstreamVideoFilename(node);
+                if (filename) {
+                    const key = `p_fn_${filename.replace(/[^a-zA-Z0-9]/g, "_")}`;
+                    if (state.previewKey === key && state.numFrames > 0) {
+                        await loadFrameFromCurrentSource(state.curIdx);
+                        return;
+                    }
+                    const prep = await requestPreviewPrepare(key, filename);
+                    if (prep && !prep.error) {
+                        state.sid = null;
+                        state.previewKey = key;
+                        state.numFrames = prep.n;
+                        state.imgW = prep.w; state.imgH = prep.h;
+                        state.frames = {};
+                        state.fittedOnce = false;
+                        if (state.curIdx >= prep.n) state.curIdx = 0;
+                        state.lastFilename = filename;
                         await loadFrameFromCurrentSource(state.curIdx);
                         return;
                     }
                 }
-                const filename = findUpstreamVideoFilename(init);
-                if (!filename) {
-                    state.sid = null; state.previewKey = null;
-                    state.numFrames = 0; state.frames = {};
-                    draw(); return;
+
+                const init = findUpstreamInitNode(node);
+                if (init) {
+                    let sid = init._sam3_last_sid || null;
+                    if (!sid) {
+                        const lst = await listSessions();
+                        if (lst?.sessions?.length) sid = lst.sessions[lst.sessions.length - 1].sid;
+                    }
+                    if (sid) {
+                        const meta = await getSessionMeta(sid);
+                        if (meta) {
+                            if (state.sid !== sid) {
+                                state.sid = sid;
+                                state.previewKey = null;
+                                state.numFrames = meta.n;
+                                state.frames = {};
+                                state.imgW = meta.w; state.imgH = meta.h;
+                                state.fittedOnce = false;
+                                if (state.curIdx >= meta.n) state.curIdx = 0;
+                            }
+                            await loadFrameFromCurrentSource(state.curIdx);
+                            return;
+                        }
+                    }
                 }
-                const key = `p_fn_${filename.replace(/[^a-zA-Z0-9]/g, "_")}`;
-                if (state.previewKey === key && state.numFrames > 0) {
-                    await loadFrameFromCurrentSource(state.curIdx);
-                    return;
-                }
-                const prep = await requestPreviewPrepare(key, filename);
-                if (!prep || prep.error) { draw(); return; }
-                state.sid = null;
-                state.previewKey = key;
-                state.numFrames = prep.n;
-                state.imgW = prep.w; state.imgH = prep.h;
-                state.frames = {};
-                state.fittedOnce = false;
-                if (state.curIdx >= prep.n) state.curIdx = 0;
-                state.lastFilename = filename;
-                await loadFrameFromCurrentSource(state.curIdx);
+
+                state.sid = null; state.previewKey = null;
+                state.numFrames = 0; state.frames = {};
+                draw();
             }
             state.onUpstreamUpdate = refreshFromUpstream;
-
-            if (wMode) {
-                const oldCb = wMode.callback;
-                wMode.callback = function (v) {
-                    if (v === "points" && state.boxes.length) { state.boxes = []; commitState(); }
-                    else if (v === "boxes" && state.points.length) { state.points = []; commitState(); }
-                    state.drawingBox = null;
-                    draw();
-                    return oldCb ? oldCb.apply(this, arguments) : undefined;
-                };
-            }
 
             overlay.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
@@ -758,7 +751,6 @@ app.registerExtension({
                 }
 
                 const [ix, iy] = viewToImg(mx, my);
-                const m = mode();
 
                 if (e.button === 1) {
                     state.panning = true;
@@ -766,18 +758,25 @@ app.registerExtension({
                     return;
                 }
 
-                if (e.ctrlKey || e.metaKey) {
+                // КНОПКИ МОДИФИКАТОРЫ (Быстрое рисование без переключения модов)
+                const isCtrl = e.ctrlKey || e.metaKey;
+                const isShift = e.shiftKey;
+
+                // 1. Рисование Точек (Ctrl + ЛКМ / ПКМ)
+                if (isCtrl) {
                     const positive = e.button !== 2;
-                    if (m === "points") {
-                        state.points.push({ x: ix, y: iy, label: positive ? 1 : 0 });
-                        commitState();
-                    } else {
-                        state.drawingBox = {
-                            x0: ix, y0: iy, x1: ix, y1: iy,
-                            positive,
-                        };
-                        draw();
-                    }
+                    state.points.push({ x: ix, y: iy, label: positive ? 1 : 0, img_w: state.imgW, img_h: state.imgH });
+                    commitState();
+                    return;
+                }
+
+                // 2. Рисование Боксов (Shift + ЛКМ / ПКМ)
+                if (isShift) {
+                    const positive = e.button !== 2;
+                    state.drawingBox = {
+                        x0: ix, y0: iy, x1: ix, y1: iy, positive,
+                    };
+                    draw();
                     return;
                 }
 
@@ -830,6 +829,8 @@ app.registerExtension({
                         const p = state.points[state.dragTarget.idx];
                         p.x = state.dragStart.orig.x + (ix - state.dragStart.mx);
                         p.y = state.dragStart.orig.y + (iy - state.dragStart.my);
+                        p.img_w = state.imgW;
+                        p.img_h = state.imgH;
                     } else {
                         const b = state.boxes[state.dragTarget.idx];
                         const o = state.dragStart.orig;
@@ -849,6 +850,8 @@ app.registerExtension({
                             if (h.includes("s")) Y1 = ny1 + dy;
                             b.x0 = X0; b.x1 = X1; b.y0 = Y0; b.y1 = Y1;
                         }
+                        b.img_w = state.imgW;
+                        b.img_h = state.imgH;
                     }
                     draw();
                     return;
@@ -875,11 +878,11 @@ app.registerExtension({
                     const b = state.drawingBox;
                     if (Math.abs(b.x1 - b.x0) > 3 && Math.abs(b.y1 - b.y0) > 3) {
                         state.boxes.push({
-                            x0: Math.min(b.x0, b.x1),
-                            y0: Math.min(b.y0, b.y1),
-                            x1: Math.max(b.x0, b.x1),
-                            y1: Math.max(b.y0, b.y1),
+                            x0: Math.min(b.x0, b.x1), y0: Math.min(b.y0, b.y1),
+                            x1: Math.max(b.x0, b.x1), y1: Math.max(b.y0, b.y1),
                             positive: b.positive !== false,
+                            img_w: state.imgW,
+                            img_h: state.imgH,
                         });
                         commitState();
                     }
@@ -894,6 +897,7 @@ app.registerExtension({
                         const x0 = Math.min(b.x0, b.x1), x1 = Math.max(b.x0, b.x1);
                         const y0 = Math.min(b.y0, b.y1), y1 = Math.max(b.y0, b.y1);
                         b.x0 = x0; b.x1 = x1; b.y0 = y0; b.y1 = y1;
+                        b.img_w = state.imgW; b.img_h = state.imgH;
                     }
                     commitState();
                 }
@@ -997,9 +1001,7 @@ app.registerExtension({
             }, 100);
 
             setInterval(() => {
-                const init = findUpstreamInitNode(node);
-                if (!init || init._sam3_last_sid) return;
-                const fn = findUpstreamVideoFilename(init);
+                const fn = findUpstreamVideoFilename(node);
                 if (fn && fn !== state.lastFilename) refreshFromUpstream();
             }, 1500);
 

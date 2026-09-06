@@ -1,6 +1,6 @@
 """
 SAM3 Video Tracking Nodes for ComfyUI
-Memory-Safe & Unified Editor Edition + Direct File Preview API
+Multi-Prompt Edition (Points + Boxes + Text + Precision Coordinate Scaling)
 """
 
 import os
@@ -18,33 +18,22 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from PIL import Image
-
 from aiohttp import web
 from server import PromptServer
-
 import folder_paths
 from .utils import get_comfy_models_dir
 from .sam3_lib.model_builder import build_sam3_video_predictor
 
 log = logging.getLogger("sam3.video")
 
-# =============================================================================
-# Global RAM caches
-# =============================================================================
-_VIDEO_MODEL_CACHE = {}       # {ckpt_path: predictor}
-_SESSION_FRAMES_CACHE = {}    # {session_id: {"b64":[...], "w":W, "h":H, "n":N}}
-_PREVIEW_CACHE = {}           # {preview_key: {"b64":[...], "w":..., "h":..., "n":...}}
+_VIDEO_MODEL_CACHE = {}
+_SESSION_FRAMES_CACHE = {}
+_PREVIEW_CACHE = {}
 
-
-# =============================================================================
-# Utility functions
-# =============================================================================
 def _frames_signature(video_frames):
     if video_frames is None or not hasattr(video_frames, "shape"):
         return "none"
-    n = int(video_frames.shape[0])
-    h = int(video_frames.shape[1])
-    w = int(video_frames.shape[2])
+    n, h, w = int(video_frames.shape[0]), int(video_frames.shape[1]), int(video_frames.shape[2])
     try:
         sub_0 = video_frames[0, ::32, ::32].contiguous().cpu().numpy()
         sub_m = video_frames[n // 2, ::32, ::32].contiguous().cpu().numpy()
@@ -53,7 +42,6 @@ def _frames_signature(video_frames):
     except Exception:
         val_hash = "error"
     return f"{n}x{h}x{w}_{val_hash}"
-
 
 def _encode_frames_for_ui(frames, max_w=640, q=75):
     out = []
@@ -67,316 +55,224 @@ def _encode_frames_for_ui(frames, max_w=640, q=75):
         out.append(base64.b64encode(buf.getvalue()).decode("ascii"))
     return out
 
-
 def _extract_frames_from_file(filename, max_w=640, max_frames=150, q=75):
-    """Directly extracts preview frames from video/image file path before Queue execution."""
     file_path = None
-    try:
-        file_path = folder_paths.get_annotated_filepath(filename)
-    except Exception:
-        pass
+    try: file_path = folder_paths.get_annotated_filepath(filename)
+    except: pass
 
     if not file_path or not os.path.exists(file_path):
         p = Path(filename)
-        if p.exists():
-            file_path = str(p)
+        if p.exists(): file_path = str(p)
         else:
-            inp_dir = Path(folder_paths.get_input_directory())
-            cand = inp_dir / filename
-            if cand.exists():
-                file_path = str(cand)
+            cand = Path(folder_paths.get_input_directory()) / filename
+            if cand.exists(): file_path = str(cand)
 
     if not file_path or not os.path.exists(file_path):
-        raise FileNotFoundError(f"Video/Image file not found: {filename}")
+        raise FileNotFoundError(f"File not found: {filename}")
 
     out_b64 = []
     w, h = 0, 0
-
-    # 1. Try Image / GIF / Animated WebP
     try:
         im = Image.open(file_path)
         if getattr(im, "is_animated", False):
-            n_frames = min(im.n_frames, max_frames)
-            for i in range(n_frames):
+            for i in range(min(im.n_frames, max_frames)):
                 im.seek(i)
-                frame = im.convert("RGB")
-                if i == 0:
-                    w, h = frame.width, frame.height
-                if frame.width > max_w:
-                    frame = frame.resize((max_w, int(frame.height * max_w / frame.width)), Image.BILINEAR)
+                f = im.convert("RGB")
+                if i == 0: w, h = f.width, f.height
+                if f.width > max_w: f = f.resize((max_w, int(f.height * max_w / f.width)), Image.BILINEAR)
                 buf = BytesIO()
-                frame.save(buf, format="JPEG", quality=q)
+                f.save(buf, format="JPEG", quality=q)
                 out_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
             return out_b64, w, h
         else:
-            frame = im.convert("RGB")
-            w, h = frame.width, frame.height
-            if frame.width > max_w:
-                frame = frame.resize((max_w, int(frame.height * max_w / frame.width)), Image.BILINEAR)
+            f = im.convert("RGB")
+            w, h = f.width, f.height
+            if f.width > max_w: f = f.resize((max_w, int(f.height * max_w / f.width)), Image.BILINEAR)
             buf = BytesIO()
-            frame.save(buf, format="JPEG", quality=q)
+            f.save(buf, format="JPEG", quality=q)
             out_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
             return out_b64, w, h
-    except Exception:
-        pass
+    except: pass
 
-    # 2. Try Video via OpenCV
     try:
         import cv2
         cap = cv2.VideoCapture(file_path)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            count = 0
-            while cap.isOpened() and count < max_frames:
+            c = 0
+            while cap.isOpened() and c < max_frames:
                 ret, frame = cap.read()
-                if not ret:
-                    break
+                if not ret: break
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame)
-                if pil_img.width > max_w:
-                    pil_img = pil_img.resize((max_w, int(pil_img.height * max_w / pil_img.width)), Image.BILINEAR)
+                pi = Image.fromarray(frame)
+                if pi.width > max_w: pi = pi.resize((max_w, int(pi.height * max_w / pi.width)), Image.BILINEAR)
                 buf = BytesIO()
-                pil_img.save(buf, format="JPEG", quality=q)
+                pi.save(buf, format="JPEG", quality=q)
                 out_b64.append(base64.b64encode(buf.getvalue()).decode("ascii"))
-                count += 1
+                c += 1
             cap.release()
-            if out_b64:
-                return out_b64, w, h
-    except Exception as cv_err:
-        log.warning(f"cv2 frame extraction failed: {cv_err}")
+            if out_b64: return out_b64, w, h
+    except: pass
+    raise RuntimeError(f"Could not read frames from: {file_path}")
 
-    raise RuntimeError(f"Could not read video/image frames from: {file_path}")
-
-
-def _session_alive(video_model, session_id):
-    if not session_id:
-        return False
+def _session_alive(vm, sid):
+    if not sid: return False
     try:
-        getter = getattr(video_model, "_get_session", None)
-        if getter is None:
-            return True
-        getter(session_id)
+        g = getattr(vm, "_get_session", None)
+        if g is None: return True
+        g(sid)
         return True
-    except Exception:
-        return False
+    except: return False
 
-
-def _recover_session(session, skip_node=None):
-    video_model = session["model"]
-    frames = session.get("frames")
-    if frames is None:
-        raise RuntimeError("[SAM3] Cannot recover session: session['frames'] missing.")
-
-    _ensure_video_model_on_device(video_model)
-
-    old_session_id = session.get("session_id")
-    if old_session_id:
-        try:
-            video_model.close_session(old_session_id)
-        except Exception:
-            pass
-
-    temp_dir = session.get("temp_dir")
-    if not temp_dir or not Path(temp_dir).exists():
-        temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
-        num_frames = int(frames.shape[0])
-        for i in range(num_frames):
-            array = frames[i].detach().cpu().numpy()
-            array = (np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
-            Image.fromarray(array).save(os.path.join(temp_dir, f"{i:05d}.jpg"))
-        session["temp_dir"] = temp_dir
-
-    with torch.inference_mode():
-        with _video_autocast(video_model):
-            response = video_model.start_session(resource_path=temp_dir, session_id=None)
-    session["session_id"] = response["session_id"]
-
-    old_cache = _SESSION_FRAMES_CACHE.pop(old_session_id, None)
-    if old_cache:
-        _SESSION_FRAMES_CACHE[session["session_id"]] = old_cache
-
-    for entry in session.get("_prompts_seq", []):
-        if skip_node is not None and str(entry.get("node")) == str(skip_node):
-            continue
-        model = getattr(video_model, "model", None)
-        old_threshold = getattr(model, "score_threshold_detection", None)
-        try:
-            if old_threshold is not None:
-                model.score_threshold_detection = float(entry.get("threshold", old_threshold))
-            _video_add_prompt(
-                session=session,
-                frame_idx=entry["frame_idx"],
-                obj_id=entry["obj_id"],
-                points=entry.get("points"),
-                point_labels=entry.get("point_labels"),
-                boxes=entry.get("boxes"),
-                box_labels=entry.get("box_labels"),
-            )
-        finally:
-            if old_threshold is not None:
-                model.score_threshold_detection = old_threshold
-
-
-def _ensure_video_model_on_device(video_model):
-    model = getattr(video_model, "model", None)
-    if model is None:
-        return False
-    try:
-        current_device = next(model.parameters()).device
-    except StopIteration:
-        return False
-    target_device = (torch.device("cuda", torch.cuda.current_device())
-                     if torch.cuda.is_available() else torch.device("cpu"))
-    if current_device != target_device:
-        model.to(device=target_device)
+def _ensure_video_model_on_device(vm):
+    m = getattr(vm, "model", None)
+    if m is None: return False
+    try: current_device = next(m.parameters()).device
+    except StopIteration: return False
+    target = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    if current_device != target:
+        m.to(device=target)
         return True
     return False
 
-
-def _video_autocast(video_model):
-    model = getattr(video_model, "model", None)
-    if model is None:
-        return nullcontext()
-    try:
-        device = next(model.parameters()).device
-    except StopIteration:
-        return nullcontext()
-    if device.type != "cuda":
-        return nullcontext()
+def _video_autocast(vm):
+    m = getattr(vm, "model", None)
+    if m is None: return nullcontext()
+    try: device = next(m.parameters()).device
+    except StopIteration: return nullcontext()
+    if device.type != "cuda": return nullcontext()
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=True)
 
+def _video_add_prompt(session, frame_idx, obj_id, points=None, point_labels=None, boxes=None, box_labels=None, text=None):
+    vm = session["model"]
+    _ensure_video_model_on_device(vm)
 
-def _video_add_prompt(session, frame_idx, obj_id, points=None, point_labels=None,
-                     boxes=None, box_labels=None):
-    video_model = session["model"]
-    _ensure_video_model_on_device(video_model)
+    p_arr = np.array(points, dtype=np.float32) if points is not None and len(points) > 0 else None
+    pl_arr = np.array(point_labels, dtype=np.int32) if point_labels is not None and len(point_labels) > 0 else None
+
+    b_arr = np.array(boxes, dtype=np.float32) if boxes is not None and len(boxes) > 0 else None
+    bl_arr = np.array(box_labels, dtype=np.int32) if box_labels is not None and len(box_labels) > 0 else None
+
+    txt = text.strip() if text and text.strip() else None
+
     with torch.inference_mode():
-        with _video_autocast(video_model):
-            return video_model.add_prompt(
+        with _video_autocast(vm):
+            return vm.add_prompt(
                 session_id=session["session_id"],
                 frame_idx=int(frame_idx),
-                text=None,
-                points=points,
-                point_labels=point_labels,
-                bounding_boxes=boxes,
-                bounding_box_labels=box_labels,
+                text=txt,
+                points=p_arr,
+                point_labels=pl_arr,
+                bounding_boxes=b_arr,
+                bounding_box_labels=bl_arr,
                 obj_id=int(obj_id),
             )
 
+def _recover_session(session, skip_node=None):
+    vm = session["model"]
+    frames = session.get("frames")
+    if frames is None: raise RuntimeError("[SAM3] Cannot recover session: frames missing.")
+    _ensure_video_model_on_device(vm)
+    old_sid = session.get("session_id")
+    if old_sid:
+        try: vm.close_session(old_sid)
+        except: pass
+
+    tdir = session.get("temp_dir")
+    if not tdir or not Path(tdir).exists():
+        tdir = tempfile.mkdtemp(prefix="sam3_video_")
+        for i in range(int(frames.shape[0])):
+            arr = (np.clip(frames[i].detach().cpu().numpy(), 0.0, 1.0) * 255.0).astype(np.uint8)
+            Image.fromarray(arr).save(os.path.join(tdir, f"{i:05d}.jpg"))
+        session["temp_dir"] = tdir
+
+    with torch.inference_mode():
+        with _video_autocast(vm):
+            resp = vm.start_session(resource_path=tdir, session_id=None)
+    session["session_id"] = resp["session_id"]
+
+    if old_sid in _SESSION_FRAMES_CACHE:
+        _SESSION_FRAMES_CACHE[session["session_id"]] = _SESSION_FRAMES_CACHE.pop(old_sid)
+
+    for entry in session.get("_prompts_seq", []):
+        if skip_node is not None and str(entry.get("node")) == str(skip_node): continue
+        m = getattr(vm, "model", None)
+        old_t = getattr(m, "score_threshold_detection", None)
+        try:
+            if old_t is not None: m.score_threshold_detection = float(entry.get("threshold", old_t))
+            
+            ebixes = entry.get("boxes")
+            epoints = entry.get("points")
+            etxt = entry.get("text")
+
+            # Двухэтапная отправка для обхода AssertionError в SAM3 core
+            if ebixes or etxt:
+                _video_add_prompt(
+                    session=session, frame_idx=entry["frame_idx"], obj_id=entry["obj_id"],
+                    points=None, point_labels=None,
+                    boxes=ebixes, box_labels=entry.get("box_labels"), text=etxt
+                )
+            if epoints:
+                _video_add_prompt(
+                    session=session, frame_idx=entry["frame_idx"], obj_id=entry["obj_id"],
+                    points=epoints, point_labels=entry.get("point_labels"),
+                    boxes=None, box_labels=None, text=None
+                )
+        finally:
+            if old_t is not None: m.score_threshold_detection = old_t
 
 def _is_recoverable_session_error(error):
-    message = str(error).lower()
-    markers = (
-        "cannot find session", "might have expired",
-        "input type", "weight type", "bias type", "should be the same",
-        "expected all tensors to be on the same device",
-    )
-    return any(m in message for m in markers)
+    m = str(error).lower()
+    return any(x in m for x in ("cannot find session", "might have expired", "input type", "weight type", "bias type", "should be the same", "expected all tensors"))
 
-
-# =============================================================================
-# REST Endpoints for Pre-Queue Frame Preview & Live Editing
-# =============================================================================
+# REST API
 @PromptServer.instance.routes.post("/sam3/prepare_frames")
 async def sam3_prepare_frames(request):
     try:
         body = await request.json()
         key = body.get("preview_key")
-        filename = body.get("filename") or body.get("video") or body.get("image")
-
-        if not filename and "node" in body:
-            inputs = body["node"].get("inputs", {})
-            for k in ("video", "image", "file", "filename", "upload"):
-                if k in inputs and isinstance(inputs[k], str):
-                    filename = inputs[k]
-                    break
-
-        if not key or not filename:
-            return web.json_response({"error": "missing preview_key or filename"}, status=400)
-
-        cached = _PREVIEW_CACHE.get(key)
-        if cached is not None:
-            return web.json_response({"cached": True, "n": cached["n"],
-                                      "w": cached["w"], "h": cached["h"],
-                                      "preview_key": key})
-
+        filename = body.get("filename")
+        if not key or not filename: return web.json_response({"error": "missing key/filename"}, status=400)
+        if key in _PREVIEW_CACHE:
+            c = _PREVIEW_CACHE[key]
+            return web.json_response({"cached": True, "n": c["n"], "w": c["w"], "h": c["h"], "preview_key": key})
         loop = asyncio.get_event_loop()
         b64_list, w, h = await loop.run_in_executor(None, _extract_frames_from_file, filename)
         n = len(b64_list)
         _PREVIEW_CACHE[key] = {"b64": b64_list, "w": w, "h": h, "n": n}
         return web.json_response({"cached": False, "n": n, "w": w, "h": h, "preview_key": key})
-    except Exception as e:
-        log.exception("prepare_frames failed")
-        return web.json_response({"error": str(e)}, status=500)
-
-
-@PromptServer.instance.routes.get("/sam3/preview_frames/{key}")
-async def sam3_preview_meta(request):
-    key = request.match_info["key"]
-    info = _PREVIEW_CACHE.get(key)
-    if info is None:
-        return web.json_response({"error": "not cached"}, status=404)
-    return web.json_response({"preview_key": key, "n": info["n"],
-                              "w": info["w"], "h": info["h"]})
-
+    except Exception as e: return web.json_response({"error": str(e)}, status=500)
 
 @PromptServer.instance.routes.get("/sam3/preview_frames/{key}/{idx}")
 async def sam3_preview_frame(request):
     key = request.match_info["key"]
-    try:
-        idx = int(request.match_info["idx"])
-    except Exception:
-        return web.json_response({"error": "bad idx"}, status=400)
-    info = _PREVIEW_CACHE.get(key)
-    if info is None:
-        return web.json_response({"error": "not cached"}, status=404)
-    if idx < 0 or idx >= len(info["b64"]):
-        return web.json_response({"error": "idx out of range"}, status=400)
-    return web.json_response({"preview_key": key, "idx": idx,
-                              "n": info["n"], "w": info["w"], "h": info["h"],
-                              "b64": info["b64"][idx]})
-
+    idx = int(request.match_info["idx"])
+    c = _PREVIEW_CACHE.get(key)
+    if not c or idx < 0 or idx >= c["n"]: return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"preview_key": key, "idx": idx, "n": c["n"], "w": c["w"], "h": c["h"], "b64": c["b64"][idx]})
 
 @PromptServer.instance.routes.get("/sam3/video_frames/list")
 async def sam3_video_frames_list(request):
-    return web.json_response({"sessions": [
-        {"sid": sid, "n": v["n"], "w": v["w"], "h": v["h"]}
-        for sid, v in _SESSION_FRAMES_CACHE.items()
-    ]})
-
+    return web.json_response({"sessions": [{"sid": k, "n": v["n"], "w": v["w"], "h": v["h"]} for k, v in _SESSION_FRAMES_CACHE.items()]})
 
 @PromptServer.instance.routes.get("/sam3/video_frames/{sid}")
 async def sam3_video_frames_meta(request):
     sid = request.match_info["sid"]
-    info = _SESSION_FRAMES_CACHE.get(sid)
-    if info is None:
-        return web.json_response({"error": "not cached"}, status=404)
-    return web.json_response({"sid": sid, "n": info["n"],
-                              "w": info["w"], "h": info["h"]})
-
+    c = _SESSION_FRAMES_CACHE.get(sid)
+    if not c: return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"sid": sid, "n": c["n"], "w": c["w"], "h": c["h"]})
 
 @PromptServer.instance.routes.get("/sam3/video_frames/{sid}/{idx}")
 async def sam3_video_frames_get(request):
     sid = request.match_info["sid"]
-    try:
-        idx = int(request.match_info["idx"])
-    except Exception:
-        return web.json_response({"error": "bad idx"}, status=400)
-    info = _SESSION_FRAMES_CACHE.get(sid)
-    if info is None:
-        return web.json_response({"error": "not cached"}, status=404)
-    if idx < 0 or idx >= len(info["b64"]):
-        return web.json_response({"error": "idx out of range"}, status=400)
-    return web.json_response({"sid": sid, "idx": idx, "n": info["n"],
-                              "w": info["w"], "h": info["h"],
-                              "b64": info["b64"][idx]})
+    idx = int(request.match_info["idx"])
+    c = _SESSION_FRAMES_CACHE.get(sid)
+    if not c or idx < 0 or idx >= c["n"]: return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"sid": sid, "idx": idx, "n": c["n"], "w": c["w"], "h": c["h"], "b64": c["b64"][idx]})
 
-
-# =============================================================================
-# Nodes
-# =============================================================================
+# NODES
 class SAM3VideoModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -387,49 +283,39 @@ class SAM3VideoModelLoader:
             },
             "optional": {"hf_token": ("STRING", {"default": ""})}
         }
-
     RETURN_TYPES = ("SAM3_VIDEO_MODEL",)
     RETURN_NAMES = ("video_model",)
     FUNCTION = "load_model"
     CATEGORY = "SAM3/video"
 
     def load_model(self, checkpoint_path="", use_gpu_cache=True, hf_token=""):
-        resolved = self._resolve_checkpoint(checkpoint_path)
+        res = self._resolve(checkpoint_path)
         global _VIDEO_MODEL_CACHE
-        if resolved in _VIDEO_MODEL_CACHE:
-            predictor = _VIDEO_MODEL_CACHE[resolved]
-            predictor.use_gpu_cache = use_gpu_cache
-            if use_gpu_cache and hasattr(predictor, "model") and torch.cuda.is_available():
-                predictor.model.to("cuda")
-            return (predictor,)
-
+        if res in _VIDEO_MODEL_CACHE:
+            p = _VIDEO_MODEL_CACHE[res]
+            p.use_gpu_cache = use_gpu_cache
+            if use_gpu_cache and hasattr(p, "model") and torch.cuda.is_available(): p.model.to("cuda")
+            return (p,)
         bpe = Path(__file__).parent / "sam3_lib" / "bpe_simple_vocab_16e6.txt.gz"
-        if not bpe.exists():
-            bpe = Path(__file__).parent.parent / "sam3" / "bpe_simple_vocab_16e6.txt.gz"
-
-        predictor = build_sam3_video_predictor(
-            checkpoint_path=resolved, bpe_path=str(bpe),
-            hf_token=hf_token if hf_token else None, gpus_to_use=None,
-        )
-        predictor.use_gpu_cache = use_gpu_cache
-        predictor.model.eval()
-        _VIDEO_MODEL_CACHE[resolved] = predictor
-        return (predictor,)
+        if not bpe.exists(): bpe = Path(__file__).parent.parent / "sam3" / "bpe_simple_vocab_16e6.txt.gz"
+        p = build_sam3_video_predictor(checkpoint_path=res, bpe_path=str(bpe), hf_token=hf_token or None, gpus_to_use=None)
+        p.use_gpu_cache = use_gpu_cache
+        p.model.eval()
+        _VIDEO_MODEL_CACHE[res] = p
+        return (p,)
 
     @staticmethod
-    def _resolve_checkpoint(user_path):
-        from folder_paths import base_path as comfy_base
+    def _resolve(user_path):
+        from folder_paths import base_path
         if user_path and user_path.strip():
             p = Path(user_path.strip())
-            if p.exists() and p.is_file():
-                return str(p.resolve())
-            raise FileNotFoundError(f"[SAM3 Video] Not found: {user_path}")
-        models_dir = Path(comfy_base) / "models" / "sam3"
-        for name in ("sam3.safetensors", "sam3.pt"):
-            c = models_dir / name
-            if c.exists() and c.is_file() and c.stat().st_size > 1_000_000:
-                return str(c.resolve())
-        raise FileNotFoundError(f"[SAM3 Video] No checkpoint found in {models_dir}")
+            if p.exists() and p.is_file(): return str(p.resolve())
+            raise FileNotFoundError(f"Not found: {user_path}")
+        mdir = Path(base_path) / "models" / "sam3"
+        for n in ("sam3.safetensors", "sam3.pt"):
+            c = mdir / n
+            if c.exists() and c.is_file() and c.stat().st_size > 1000000: return str(c.resolve())
+        raise FileNotFoundError("No sam3 checkpoint found")
 
 
 class SAM3InitVideoSession:
@@ -438,7 +324,7 @@ class SAM3InitVideoSession:
         return {
             "required": {
                 "video_model": ("SAM3_VIDEO_MODEL",),
-                "video_frames": ("IMAGE", {"tooltip": "Video frames batch [N, H, W, C]."}),
+                "video_frames": ("IMAGE",),
             },
             "optional": {
                 "session_id": ("STRING", {"default": ""}),
@@ -446,20 +332,17 @@ class SAM3InitVideoSession:
                 "new_det_thresh": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
             }
         }
-
     @classmethod
     def IS_CHANGED(cls, video_frames=None, session_id="", **kwargs):
         params = "|".join(f"{k}={v}" for k, v in sorted(kwargs.items()) if k != "video_model")
         return f"{session_id}|{_frames_signature(video_frames)}|{params}"
-
     RETURN_TYPES = ("SAM3_VIDEO_SESSION", "STRING")
     RETURN_NAMES = ("session", "session_id")
     FUNCTION = "init_session"
     CATEGORY = "SAM3/video"
     OUTPUT_NODE = True
 
-    def init_session(self, video_model, video_frames, session_id="",
-                     score_threshold_detection=0.3, new_det_thresh=0.4):
+    def init_session(self, video_model, video_frames, session_id="", score_threshold_detection=0.3, new_det_thresh=0.4):
         m = video_model.model
         m.score_threshold_detection = score_threshold_detection
         m.new_det_thresh = new_det_thresh
@@ -473,56 +356,37 @@ class SAM3InitVideoSession:
         m.decrease_trk_keep_alive_for_empty_masklets = False
         m.suppress_unmatched_only_within_hotstart = True
 
-        sid_to_use = session_id if session_id else None
-        if sid_to_use:
-            try:
-                video_model.get_session_state(sid_to_use)
-            except Exception:
+        sid = session_id or None
+        if sid:
+            try: video_model.get_session_state(sid)
+            except:
                 import uuid
-                sid_to_use = f"auto_recovered_{uuid.uuid4().hex[:8]}"
+                sid = f"auto_recovered_{uuid.uuid4().hex[:8]}"
 
-        temp_dir = tempfile.mkdtemp(prefix="sam3_video_")
-        num_frames = int(video_frames.shape[0])
-        for i in range(num_frames):
-            frame = (video_frames[i].cpu().numpy() * 255).astype(np.uint8)
-            Image.fromarray(frame).save(os.path.join(temp_dir, f"{i:05d}.jpg"))
+        tdir = tempfile.mkdtemp(prefix="sam3_video_")
+        num = int(video_frames.shape[0])
+        for i in range(num):
+            arr = (video_frames[i].cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(arr).save(os.path.join(tdir, f"{i:05d}.jpg"))
 
-        try:
-            response = video_model.start_session(resource_path=temp_dir, session_id=sid_to_use)
-        except Exception:
+        try: resp = video_model.start_session(resource_path=tdir, session_id=sid)
+        except:
             import uuid
-            sid_to_use = f"emergency_{uuid.uuid4().hex[:8]}"
-            response = video_model.start_session(resource_path=temp_dir, session_id=sid_to_use)
+            resp = video_model.start_session(resource_path=tdir, session_id=f"emergency_{uuid.uuid4().hex[:8]}")
 
-        actual_session_id = response["session_id"]
-        h = int(video_frames.shape[1])
-        w = int(video_frames.shape[2])
-
-        session_data = {
-            "model": video_model,
-            "session_id": actual_session_id,
-            "temp_dir": temp_dir,
-            "num_frames": num_frames,
-            "height": h, "width": w,
-            "frames": video_frames.detach().cpu(),
-            "_prompt_history": [],
+        actual_sid = resp["session_id"]
+        h, w = int(video_frames.shape[1]), int(video_frames.shape[2])
+        sd = {
+            "model": video_model, "session_id": actual_sid, "temp_dir": tdir,
+            "num_frames": num, "height": h, "width": w,
+            "frames": video_frames.detach().cpu(), "_prompt_history": [],
         }
+        b64 = _encode_frames_for_ui(video_frames)
+        _SESSION_FRAMES_CACHE[actual_sid] = {"b64": b64, "w": w, "h": h, "n": num}
+        sd["_ui_frames_b64"] = b64
+        sd["_ui_cache_key"] = f"sam3-video:{actual_sid}"
 
-        b64_frames = _encode_frames_for_ui(video_frames)
-        _SESSION_FRAMES_CACHE[actual_session_id] = {
-            "b64": b64_frames, "w": w, "h": h, "n": num_frames,
-        }
-        session_data["_ui_frames_b64"] = b64_frames
-        session_data["_ui_cache_key"] = f"sam3-video:{actual_session_id}"
-
-        return {
-            "ui": {
-                "session_id": [actual_session_id],
-                "num_frames": [num_frames],
-                "width": [w], "height": [h],
-            },
-            "result": (session_data, actual_session_id),
-        }
+        return {"ui": {"session_id": [actual_sid], "num_frames": [num], "width": [w], "height": [h]}, "result": (sd, actual_sid)}
 
 
 class SAM3InitVideoSessionAdvanced(SAM3InitVideoSession):
@@ -541,74 +405,61 @@ class SAM3InitVideoSessionAdvanced(SAM3InitVideoSession):
             "suppress_unmatched_globally": ("BOOLEAN", {"default": True}),
         })
         return base
-
-    def init_session(self, video_model, video_frames, session_id="",
-                     score_threshold_detection=0.3, new_det_thresh=0.4,
-                     fill_hole_area=16, assoc_iou_thresh=0.1, det_nms_thresh=0.1,
-                     hotstart_unmatch_thresh=8, hotstart_dup_thresh=8,
-                     init_trk_keep_alive=30, hotstart_delay=15,
-                     decrease_keep_alive_empty=False, suppress_unmatched_globally=True):
+    def init_session(self, video_model, video_frames, session_id="", score_threshold_detection=0.3, new_det_thresh=0.4, **kw):
         m = video_model.model
         m.score_threshold_detection = score_threshold_detection
         m.new_det_thresh = new_det_thresh
-        m.fill_hole_area = fill_hole_area
-        m.assoc_iou_thresh = assoc_iou_thresh
-        m.det_nms_thresh = det_nms_thresh
-        m.hotstart_unmatch_thresh = hotstart_unmatch_thresh
-        m.hotstart_dup_thresh = hotstart_dup_thresh
-        m.init_trk_keep_alive = init_trk_keep_alive
-        m.hotstart_delay = hotstart_delay
-        m.decrease_trk_keep_alive_for_empty_masklets = decrease_keep_alive_empty
-        m.suppress_unmatched_only_within_hotstart = not suppress_unmatched_globally
-        return super().init_session(video_model, video_frames, session_id,
-                                    score_threshold_detection, new_det_thresh)
+        m.fill_hole_area = kw.get("fill_hole_area", 16)
+        m.assoc_iou_thresh = kw.get("assoc_iou_thresh", 0.1)
+        m.det_nms_thresh = kw.get("det_nms_thresh", 0.1)
+        m.hotstart_unmatch_thresh = kw.get("hotstart_unmatch_thresh", 8)
+        m.hotstart_dup_thresh = kw.get("hotstart_dup_thresh", 8)
+        m.init_trk_keep_alive = kw.get("init_trk_keep_alive", 30)
+        m.hotstart_delay = kw.get("hotstart_delay", 15)
+        m.decrease_trk_keep_alive_for_empty_masklets = kw.get("decrease_keep_alive_empty", False)
+        m.suppress_unmatched_only_within_hotstart = not kw.get("suppress_unmatched_globally", True)
+        return super().init_session(video_model, video_frames, session_id, score_threshold_detection, new_det_thresh)
 
 
 class SAM3VideoPromptEditor:
     DESCRIPTION = """
-### SAM3 Video Prompt Editor
+### 🎬 SAM3 Video Prompt Editor (Multi-Prompt Edition)
 
-One node = one frame = one **obj_id**. Chain several editors for multi-frame / multi-object prompts.
-
-#### Controls
-- **Ctrl+LMB** — positive point / start **positive** box  
-- **Ctrl+RMB** — negative point / start **negative** box  
-- **LMB drag** — move point or box (handles = resize)  
-- **RMB** — delete under cursor  
-- **MMB drag** — pan image  
-- **Wheel** — Comfy graph zoom (overlay follows)  
-- **F** / double-click — fit  
-- **Slider** / ◀ ▶ / arrow keys — scrub frames  
-
-Mode **points** / **boxes**: only one type is active; switching clears the other.
-
-Badges show **index within type** (4 counters): +points, −points, +boxes, −boxes (each 0,1,2…).
+One node = one frame = one **obj_id**. Chain multiple nodes to refine tracking across different frames.
 
 ---
 
-#### How boxes work in SAM 3 (PCS)
+#### 🧠 Combined Prompting (Simultaneous Modes)
+Supports **Points + Boxes + Text** simultaneously on the same frame! 
+All tools are active at the same time and triggered via specific shortcuts without any mode switches.
 
-SAM 3 uses **Promptable Concept Segmentation**: visual boxes act as **exemplars**.
-
-- **Positive box (label 1)** — “segment everything like this.”  
-- **Negative box (label 0)** — “ignore this and things like it” (e.g. referee vs players).
-
-On **images**, the grounding/image path fully supports positive + negative box labels.
-
-On **video tracker / propagate**, the session tracker often treats a box mainly as **object init** (SAM2-style). For rejecting false tracks on video, **negative points** (and/or concept/text prompts) are usually more reliable than relying on negative boxes alone during propagation. Positive boxes still work well to seed an object; negative boxes are stored and sent when the API accepts `bounding_box_labels`, but results can vary by SAM3 video build.
+#### 🎨 Canvas Controls & Shortcuts
+* 🟢 **Ctrl + LMB** — Place **Positive Point** (add character detail)
+* 🔴 **Ctrl + RMB** — Place **Negative Point** (exclude background/artifacts)
+* 🔵 **Shift + LMB Drag** — Draw **Positive Box** (main character search zone)
+* 🟠 **Shift + RMB Drag** — Draw **Negative Box** (forced exclusion zone)
+* 📐 **LMB Drag** — Move points or resize box handles
+* ❌ **RMB / Delete / Backspace** — Delete element under cursor
+* 🖐️ **MMB Drag** — Pan image
+* 🔍 **Mouse Wheel** — Zoom in/out
+* 📺 **F / Double-Click** — Fit image to view
 
 ---
 
-#### Workflow
-`Load Video` → `Init Video Session` → **this Editor** → `Propagate` → `Output`
+#### 🖼️ Optional Image Input (Character Sheet)
+Connect an external image (e.g., a **Character Sheet** with different angles) to the `image` input.
+* The editor will display this reference image for prompt placement.
+* Coordinates are automatically scaled to fit the underlying video session size.
 """
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {"session": ("SAM3_VIDEO_SESSION",)},
             "optional": {
-                "prompt_mode": (["points", "boxes"], {"default": "points"}),
-                "frame_index": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "image": ("IMAGE", {"tooltip": "Optional override (e.g. Character Sheet). Displays these reference angles for easy prompt placement."}),
+                "prompt_mode": (["points", "boxes"], {"default": "points", "tooltip": "Active drawing tool. Points and Boxes are preserved together."}),
+                "text_prompt": ("STRING", {"default": "", "multiline": False, "tooltip": "Optional text concept (e.g. 'character', 'red dress')."}),
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "obj_id": ("INT", {"default": 1, "min": 1, "max": 10000}),
                 "score_threshold": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "points_json": ("STRING", {"default": "[]", "multiline": True}),
@@ -625,80 +476,152 @@ On **video tracker / propagate**, the session tracker often treats a box mainly 
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(cls, prompt_mode="points", frame_index=0, obj_id=1,
-                   score_threshold=0.3, points_json="[]", boxes_json="[]", **kw):
-        return f"{prompt_mode}|{frame_index}|{obj_id}|{score_threshold}|{points_json}|{boxes_json}"
+    def IS_CHANGED(cls, prompt_mode="points", frame_index=0, obj_id=1, score_threshold=0.3, points_json="[]", boxes_json="[]", text_prompt="", image=None, **kw):
+        img_sig = _frames_signature(image) if image is not None else "none"
+        return f"{prompt_mode}|{frame_index}|{obj_id}|{score_threshold}|{points_json}|{boxes_json}|{text_prompt}|{img_sig}"
 
     @staticmethod
     def _load(s, fb):
-        try:
-            return json.loads(s) if s else fb
-        except Exception:
-            return fb
+        try: return json.loads(s) if s else fb
+        except: return fb
 
-    def apply(self, session, prompt_mode="points", frame_index=0, obj_id=1,
-              score_threshold=0.30, points_json="[]", boxes_json="[]",
-              ui_cache_key="", unique_id="0"):
-        if session is None:
-            raise ValueError("[SAM3] Session is empty")
+    def apply(self, session, image=None, prompt_mode="points", text_prompt="", frame_index=0, obj_id=1, score_threshold=0.30, points_json="[]", boxes_json="[]", ui_cache_key="", unique_id="0"):
+        if session is None: raise ValueError("Session empty")
         vm = session["model"]
         _ensure_video_model_on_device(vm)
 
-        frames = session.get("frames")
-        if frames is None:
-            raise ValueError("[SAM3] No frames in session. Ensure Init Session ran.")
+        frames = image.detach().cpu() if image is not None else session.get("frames")
+        if frames is None: raise ValueError("No frames found.")
 
         n, h, w = int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2])
         frame_index = max(0, min(int(frame_index), n - 1))
-        obj_id = int(obj_id)
-        score_threshold = float(score_threshold)
-
-        ck = "_ui_frames_b64"
-        if ck in session:
-            all_b64 = session[ck]
-        else:
-            all_b64 = _encode_frames_for_ui(frames)
-            session[ck] = all_b64
-            _SESSION_FRAMES_CACHE[session["session_id"]] = {
-                "b64": all_b64, "w": w, "h": h, "n": n,
-            }
-
-        pts = self._load(points_json, [])
-        boxes = self._load(boxes_json, [])
+        
+        all_b64 = _encode_frames_for_ui(frames)
         cache_key = session.get("_ui_cache_key") or f"sam3-video:{session['session_id']}"
         session["_ui_cache_key"] = cache_key
 
-        point_coords = point_labels = api_boxes = api_box_labels = None
-        if prompt_mode == "points" and pts:
-            point_coords = [[float(p["x"]), float(p["y"])] for p in pts]
-            point_labels = [int(p.get("label", 1)) for p in pts]
-        elif prompt_mode == "boxes" and boxes:
-            api_boxes, api_box_labels = [], []
+        pts = self._load(points_json, [])
+        boxes = self._load(boxes_json, [])
+
+        # 1. NORMALIZED POINTS [0.0, 1.0]
+        point_coords = []
+        point_labels = []
+        if pts:
+            for p in pts:
+                pw = float(p.get("img_w")) if p.get("img_w") else float(w)
+                ph = float(p.get("img_h")) if p.get("img_h") else float(h)
+                if pw <= 0 or ph <= 0:
+                    continue
+                
+                px_n = float(p["x"]) / pw
+                py_n = float(p["y"]) / ph
+                
+                px_n = max(0.0, min(px_n, 1.0))
+                py_n = max(0.0, min(py_n, 1.0))
+                
+                point_coords.append([px_n, py_n])
+                point_labels.append(int(p.get("label", 1)))
+
+        # 2. NORMALIZED BOXES [0.0, 1.0]
+        api_boxes = []
+        api_box_labels = []
+        if boxes:
             for b in boxes:
-                x0, y0 = min(b["x0"], b["x1"]), min(b["y0"], b["y1"])
-                x1, y1 = max(b["x0"], b["x1"]), max(b["y0"], b["y1"])
-                api_boxes.append([float(x0), float(y0), float(x1 - x0), float(y1 - y0)])
+                pw = float(b.get("img_w")) if b.get("img_w") else float(w)
+                ph = float(b.get("img_h")) if b.get("img_h") else float(h)
+                if pw <= 0 or ph <= 0:
+                    continue
+
+                x0_n = min(float(b["x0"]), float(b["x1"])) / pw
+                y0_n = min(float(b["y0"]), float(b["y1"])) / ph
+                x1_n = max(float(b["x0"]), float(b["x1"])) / pw
+                y1_n = max(float(b["y0"]), float(b["y1"])) / ph
+
+                x0_n = max(0.0, min(x0_n, 1.0))
+                y0_n = max(0.0, min(y0_n, 1.0))
+                x1_n = max(0.0, min(x1_n, 1.0))
+                y1_n = max(0.0, min(y1_n, 1.0))
+
+                if (x1_n - x0_n) < 1e-4 or (y1_n - y0_n) < 1e-4:
+                    continue
+
+                api_boxes.append([x0_n, y0_n, x1_n, y1_n])
                 api_box_labels.append(1 if b.get("positive", True) else 0)
 
-        has_prompt = bool(point_coords or api_boxes)
+        # 3. ОБРАБОТКА ОГРАНИЧЕНИЯ: Максимум 1 бокс на кадр
+        final_boxes = []
+        final_box_labels = []
+        if api_boxes:
+            # Ищем первый позитивный бокс как основной
+            primary_idx = -1
+            for idx, label in enumerate(api_box_labels):
+                if label == 1:
+                    primary_idx = idx
+                    break
+            if primary_idx == -1:
+                primary_idx = 0  # Если позитивных нет, берем первый негативный
+            
+            # Оставляем только ОДИН бокс
+            final_boxes.append(api_boxes[primary_idx])
+            final_box_labels.append(api_box_labels[primary_idx])
+            
+            # Все остальные боксы конвертируем в точки, чтобы не потерять разметку пользователя
+            for idx, (box, label) in enumerate(zip(api_boxes, api_box_labels)):
+                if idx == primary_idx:
+                    continue
+                bx0, by0, bx1, by1 = box
+                cx = (bx0 + bx1) / 2.0
+                cy = (by0 + by1) / 2.0
+                point_coords.append([cx, cy])
+                point_labels.append(label)
+                log.info(f"[SAM3] Multi-box fallback: Converted extra box {box} into point {[cx, cy]} (label {label}) because SAM3 only supports 1 box per frame.")
+
+        # 4. SMART AUTO-ANCHORING (Якорение основного бокса)
+        if final_boxes and point_coords:
+            main_box = final_boxes[0]
+            main_label = final_box_labels[0]
+            if main_label == 1:  # Только для позитивных боксов
+                bx0, by0, bx1, by1 = main_box
+                bcx = (bx0 + bx1) / 2.0
+                bcy = (by0 + by1) / 2.0
+                
+                already_anchored = any(abs(p[0] - bcx) < 0.05 and abs(p[1] - bcy) < 0.05 for p in point_coords)
+                if not already_anchored:
+                    point_coords.insert(0, [bcx, bcy])  # Приоритетный якорь
+                    point_labels.insert(0, 1)
+                    log.info(f"[SAM3] Smart Anchor: Injected positive point at box center {[bcx, bcy]} to protect mask from negative points suppression.")
+
+        # Smart fallback for multimodal text prompt
+        txt = text_prompt.strip()
+        if not txt and (point_coords or final_boxes):
+            txt = "object"
+            log.info("[SAM3] Empty text prompt. Auto-fallback to 'object' to satisfy model attention.")
+
+        if point_coords:
+            log.info(f"[SAM3] Points sent (NORMALIZED): {point_coords}")
+        if final_boxes:
+            log.info(f"[SAM3] Boxes sent (NORMALIZED): {final_boxes}")
+
+        has_prompt = bool(point_coords or final_boxes or txt)
+
         entry = {
-            "node": unique_id, "frame_idx": frame_index, "obj_id": obj_id,
-            "threshold": score_threshold,
-            "points": point_coords, "point_labels": point_labels,
-            "boxes": api_boxes, "box_labels": api_box_labels,
+            "node": unique_id, "frame_idx": frame_index, "obj_id": int(obj_id),
+            "threshold": float(score_threshold),
+            "points": point_coords if point_coords else None,
+            "point_labels": point_labels if point_labels else None,
+            "boxes": final_boxes if final_boxes else None,
+            "box_labels": final_box_labels if final_box_labels else None,
+            "text": txt if txt else None,
             "cache_key": [cache_key],
         }
         seq = session.setdefault("_prompts_seq", [])
         for i, e in enumerate(seq):
             if e.get("node") == unique_id:
-                if has_prompt:
-                    seq[i] = entry
-                else:
-                    seq.pop(i)
+                if has_prompt: seq[i] = entry
+                else: seq.pop(i)
                 break
         else:
-            if has_prompt:
-                seq.append(entry)
+            if has_prompt: seq.append(entry)
 
         was_dead = not _session_alive(vm, session.get("session_id"))
         if was_dead:
@@ -706,10 +629,9 @@ On **video tracker / propagate**, the session tracker often treats a box mainly 
             vm = session["model"]
             _ensure_video_model_on_device(vm)
 
-        committed = False
-        sig = (f"{unique_id}|{frame_index}|{obj_id}|{prompt_mode}|"
-               f"{score_threshold}|{points_json}|{boxes_json}")
         done = session.setdefault("_committed", {})
+        sig = f"{unique_id}|{frame_index}|{obj_id}|{score_threshold}|{points_json}|{boxes_json}|{txt}"
+        committed = False
 
         if was_dead:
             if has_prompt:
@@ -719,30 +641,43 @@ On **video tracker / propagate**, the session tracker often treats a box mainly 
             m = getattr(vm, "model", None)
             old = getattr(m, "score_threshold_detection", None)
             try:
-                if old is not None:
-                    m.score_threshold_detection = score_threshold
+                if old is not None: m.score_threshold_detection = float(score_threshold)
                 try:
-                    _video_add_prompt(
-                        session=session, frame_idx=frame_index, obj_id=obj_id,
-                        points=point_coords, point_labels=point_labels,
-                        boxes=api_boxes, box_labels=api_box_labels,
-                    )
+                    # Двухэтапная отправка
+                    if final_boxes or txt:
+                        _video_add_prompt(
+                            session=session, frame_idx=frame_index, obj_id=obj_id,
+                            points=None, point_labels=None,
+                            boxes=final_boxes, box_labels=final_box_labels, text=txt
+                        )
+                    if point_coords:
+                        _video_add_prompt(
+                            session=session, frame_idx=frame_index, obj_id=obj_id,
+                            points=point_coords, point_labels=point_labels,
+                            boxes=None, box_labels=None, text=None
+                        )
                 except RuntimeError as e:
-                    if not _is_recoverable_session_error(e):
-                        raise
+                    if not _is_recoverable_session_error(e): raise
                     _recover_session(session, skip_node=unique_id)
-                    _video_add_prompt(
-                        session=session, frame_idx=frame_index, obj_id=obj_id,
-                        points=point_coords, point_labels=point_labels,
-                        boxes=api_boxes, box_labels=api_box_labels,
-                    )
+                    
+                    if final_boxes or txt:
+                        _video_add_prompt(
+                            session=session, frame_idx=frame_index, obj_id=obj_id,
+                            points=None, point_labels=None,
+                            boxes=final_boxes, box_labels=final_box_labels, text=txt
+                        )
+                    if point_coords:
+                        _video_add_prompt(
+                            session=session, frame_idx=frame_index, obj_id=obj_id,
+                            points=point_coords, point_labels=point_labels,
+                            boxes=None, box_labels=None, text=None
+                        )
             finally:
-                if old is not None:
-                    m.score_threshold_detection = old
+                if old is not None: m.score_threshold_detection = old
             done[unique_id] = sig
             session.setdefault("_prompt_history", []).append({
                 "node": unique_id, "frame_idx": frame_index, "obj_id": obj_id,
-                "mode": prompt_mode, "threshold": score_threshold,
+                "threshold": score_threshold, "has_text": bool(txt)
             })
             committed = True
 
@@ -755,7 +690,6 @@ On **video tracker / propagate**, the session tracker often treats a box mainly 
             "result": (session,),
         }
 
-
 class SAM3PropagateVideo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -767,46 +701,40 @@ class SAM3PropagateVideo:
                 "max_frames": ("INT", {"default": -1, "min": -1, "max": 10000}),
             }
         }
-
     RETURN_TYPES = ("SAM3_VIDEO_MASKS", "SAM3_VIDEO_SESSION")
     RETURN_NAMES = ("video_masks", "session")
     FUNCTION = "propagate"
     CATEGORY = "SAM3/video"
 
-    def propagate(self, session, propagation_direction="both",
-                  start_frame_index=0, max_frames=-1):
-        video_model = session["model"]
-        moved = _ensure_video_model_on_device(video_model)
-        if moved or not _session_alive(video_model, session.get("session_id")):
+    def propagate(self, session, propagation_direction="both", start_frame_index=0, max_frames=-1):
+        vm = session["model"]
+        if _ensure_video_model_on_device(vm) or not _session_alive(vm, session.get("session_id")):
             _recover_session(session)
-            video_model = session["model"]
+            vm = session["model"]
 
-        session_id = session["session_id"]
-        num_frames = session["num_frames"]
-        max_track = max_frames if max_frames > 0 else num_frames
-
-        request = {
+        req = {
             "type": "propagate_in_video",
-            "session_id": session_id,
+            "session_id": session["session_id"],
             "propagation_direction": propagation_direction,
             "start_frame_index": int(start_frame_index),
-            "max_frame_num_to_track": int(max_track),
+            "max_frame_num_to_track": int(max_frames if max_frames > 0 else session["num_frames"]),
         }
         all_masks = {}
         all_obj_ids = None
         with torch.inference_mode():
-            with _video_autocast(video_model):
-                for response in video_model.handle_stream_request(request):
-                    frame_idx = response["frame_index"]
-                    outputs = response["outputs"]
-                    all_masks[frame_idx] = outputs
-                    if all_obj_ids is None:
-                        all_obj_ids = outputs.get("obj_ids", [])
+            with _video_autocast(vm):
+                for resp in vm.handle_stream_request(req):
+                    idx = resp["frame_index"]
+                    all_masks[idx] = resp["outputs"]
+                    if all_obj_ids is None: all_obj_ids = resp["outputs"].get("obj_ids", [])
+                    
+        # Safely convert numpy array to list to prevent ambiguous truth value errors
         if all_obj_ids is None:
             all_obj_ids = []
-        return ({"session": session, "masks": all_masks,
-                 "obj_ids": all_obj_ids, "num_frames": num_frames}, session)
-
+        elif hasattr(all_obj_ids, "tolist"):
+            all_obj_ids = all_obj_ids.tolist()
+            
+        return ({"session": session, "masks": all_masks, "obj_ids": all_obj_ids, "num_frames": session["num_frames"]}, session)
 
 class SAM3VideoOutput:
     @classmethod
@@ -815,57 +743,84 @@ class SAM3VideoOutput:
             "required": {"video_masks": ("SAM3_VIDEO_MASKS",)},
             "optional": {
                 "obj_id_filter": ("INT", {"default": -1, "min": -1, "max": 100, "step": 1}),
+                "invert_mask": ("BOOLEAN", {"default": False, "tooltip": "Invert mask (swap black and white)"}),
             }
         }
-
     RETURN_TYPES = ("MASK",)
     RETURN_NAMES = ("masks",)
     FUNCTION = "output_masks"
     CATEGORY = "SAM3/video"
 
-    def output_masks(self, video_masks, obj_id_filter=-1):
-        masks_dict = video_masks["masks"]
-        num_frames = video_masks["num_frames"]
-        session = video_masks["session"]
-        height, width = session["height"], session["width"]
-        output = torch.zeros((num_frames, height, width), dtype=torch.float32)
+    def output_masks(self, video_masks, obj_id_filter=-1, invert_mask=False):
+        mdict = video_masks["masks"]
+        num = video_masks["num_frames"]
+        h, w = video_masks["session"]["height"], video_masks["session"]["width"]
+        out = torch.zeros((num, h, w), dtype=torch.float32)
 
-        for frame_idx in range(num_frames):
-            if frame_idx not in masks_dict:
-                continue
-            fo = masks_dict[frame_idx]
+        for i in range(num):
+            if i not in mdict: continue
+            fo = mdict[i]
+
+            frame_masks = None
             if "video_res_masks" in fo:
-                fm = fo["video_res_masks"]
+                frame_masks = fo["video_res_masks"]
             elif "pred_masks" in fo:
-                fm = fo["pred_masks"]
-                if fm.shape[-2:] != (height, width):
-                    fm = torch.nn.functional.interpolate(
-                        fm.float(), size=(height, width),
-                        mode="bilinear", align_corners=False)
+                frame_masks = fo["pred_masks"]
             elif "out_binary_masks" in fo:
-                fm = torch.from_numpy(fo["out_binary_masks"])
-                if fm.ndim == 3:
-                    fm = fm.unsqueeze(1)
-                if fm.shape[-2:] != (height, width):
-                    fm = torch.nn.functional.interpolate(
-                        fm.float(), size=(height, width),
-                        mode="bilinear", align_corners=False) > 0.5
+                frame_masks = fo["out_binary_masks"]
             else:
                 continue
+
+            if frame_masks is None:
+                continue
+
+            if isinstance(frame_masks, np.ndarray):
+                frame_masks = torch.from_numpy(frame_masks)
+
+            frame_masks = frame_masks.cpu()
+
+            # Ensure 3D tensor: (num_objects, height, width)
+            if frame_masks.ndim == 4:
+                if frame_masks.shape[1] == 1:
+                    frame_masks = frame_masks.squeeze(1)
+                elif frame_masks.shape[0] == 1:
+                    frame_masks = frame_masks.squeeze(0)
+            elif frame_masks.ndim == 2:
+                frame_masks = frame_masks.unsqueeze(0)
+
+            # Resize to session width & height if needed
+            if frame_masks.shape[-2:] != (h, w):
+                frame_masks = torch.nn.functional.interpolate(
+                    frame_masks.float().unsqueeze(1),
+                    size=(h, w),
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze(1)
 
             ids = fo.get("obj_ids", [])
+            if hasattr(ids, "tolist"):
+                ids = ids.tolist()
+
+            num_objs = frame_masks.shape[0]
+
             if obj_id_filter > 0:
                 try:
-                    if hasattr(ids, "tolist"): ids = ids.tolist()
-                    j = ids.index(obj_id_filter)
-                    mask = fm[j, 0] > 0.0
+                    idx = ids.index(obj_id_filter)
+                    if idx < num_objs:
+                        mask = frame_masks[idx] > 0.0
+                    else:
+                        mask = torch.zeros((h, w), dtype=torch.bool)
                 except (ValueError, IndexError):
-                    mask = torch.zeros((height, width), dtype=torch.bool)
+                    mask = torch.zeros((h, w), dtype=torch.bool)
             else:
-                mask = (fm[:, 0] > 0.0).any(dim=0)
-            output[frame_idx] = mask.float().cpu()
-        return (output,)
+                mask = (frame_masks > 0.0).any(dim=0)
 
+            out[i] = mask.float()
+
+        if invert_mask:
+            out = 1.0 - out
+
+        return (out,)
 
 class SAM3CloseVideoSession:
     @classmethod
@@ -873,13 +828,10 @@ class SAM3CloseVideoSession:
         return {
             "required": {
                 "session": ("SAM3_VIDEO_SESSION",),
-                "close_session": ("BOOLEAN", {"default": False,
-                    "label_on": "Close session", "label_off": "Keep session alive"}),
-                "cleanup_temp_files": ("BOOLEAN", {"default": True,
-                    "label_on": "Delete temp files", "label_off": "Keep temp files"}),
+                "close_session": ("BOOLEAN", {"default": False}),
+                "cleanup_temp_files": ("BOOLEAN", {"default": True}),
             },
         }
-
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("status",)
     OUTPUT_NODE = True
@@ -887,27 +839,23 @@ class SAM3CloseVideoSession:
     CATEGORY = "SAM3/video"
 
     def close_session(self, session, close_session=False, cleanup_temp_files=True):
-        video_model = session["model"]
+        vm = session["model"]
         sid = session["session_id"]
-        tmp_dir = session.get("temp_dir")
-        if not close_session:
-            return (f"Session {sid} kept alive.",)
+        tdir = session.get("temp_dir")
+        if not close_session: return (f"Session {sid} kept alive.",)
         try:
-            video_model.close_session(sid)
+            vm.close_session(sid)
             status = f"Session {sid} closed"
-        except Exception as e:
-            status = f"Close warning: {e}"
+        except Exception as e: status = f"Close warning: {e}"
         _SESSION_FRAMES_CACHE.pop(sid, None)
-        if cleanup_temp_files and tmp_dir and Path(tmp_dir).exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cleanup_temp_files and tdir and Path(tdir).exists():
+            shutil.rmtree(tdir, ignore_errors=True)
             status += "; temp cleaned"
-        if (not getattr(video_model, "use_gpu_cache", True)
-                and hasattr(video_model, "model")):
-            video_model.model.to("cpu")
+        if not getattr(vm, "use_gpu_cache", True) and hasattr(vm, "model"):
+            vm.model.to("cpu")
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             import gc; gc.collect()
         return (status,)
-
 
 NODE_CLASS_MAPPINGS = {
     "SAM3VideoModelLoader": SAM3VideoModelLoader,
